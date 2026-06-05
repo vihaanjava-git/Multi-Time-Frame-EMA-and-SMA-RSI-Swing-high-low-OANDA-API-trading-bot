@@ -1,0 +1,799 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta, time, timezone
+import sympy as sp
+import time as t
+from IPython.display import clear_output
+import subprocess
+subprocess.run(["pip", "install", "oandapyV20"], check=True, capture_output=True)
+import oandapyV20
+import oandapyV20.endpoints.orders as orders
+import oandapyV20.endpoints.positions as positions
+import oandapyV20.endpoints.accounts as accounts
+from oandapyV20.contrib.requests import MarketOrderRequest
+import oandapyV20.endpoints.trades as trades_endpoints
+import math
+from dotenv import load_dotenv
+import os
+load_dotenv("account.env")
+oanda_token = os.getenv("OANDA_TOKEN")
+oanda_account_id = os.getenv("OANDA_ACCOUNT_ID")
+swing_high_index = []
+swing_high_price = []
+swing_low_index = []
+swing_low_price = []
+yf_ticker_list = []
+oanda_ticker_list = []
+forex_pairs_dic = {
+    "EUR": "EURAUD=X",
+    "GBP": "GBPAUD=X",
+    "JPY": "JPYAUD=X",
+    "CHF": "CHFAUD=X",
+    "CAD": "CADAUD=X",
+    "USD": "USDAUD=X",
+    "NZD": "NZDAUD=X",
+    "HKD": "HKDAUD=X",
+    "SGD": "SGDAUD=X",
+    "SEK": "SEKAUD=X",
+    "NOK": "NOKAUD=X",
+    "DKK": "DKKAUD=X",
+    "CNY": "CNYAUD=X",
+    "INR": "INRAUD=X",
+    "KRW": "KRWAUD=X",
+    "MXN": "MXNAUD=X",
+    "BRL": "BRLAUD=X",
+    "ZAR": "ZARAUD=X",
+    "AUD": None,
+}
+
+master_ticker = ["audjpy", "gbpjpy", "eurjpy", "eurusd", "usdjpy", "gbpusd", "audusd"]
+#master_ticker = ["audusd"]
+
+for ticker_1 in master_ticker:
+  yfticker = ticker_1.upper() + "=X"
+  yf_ticker_list.append(yfticker)
+  OANDA_ticker_build = ticker_1.upper()
+  oandaticker = OANDA_ticker_build[0:3] + "_" + OANDA_ticker_build[3:]
+  oanda_ticker_list.append(oandaticker)
+
+intersection_price_return_value = []
+intersection_trend = []
+intersection_trend_htf = []
+clse = []
+intersection_date_return_value_latest = datetime.now() - timedelta(hours=200)
+
+market_open = time(0, 0)
+market_close = time(23, 0)
+
+rsi_state = {}
+def rsi(ticker):
+    data = yf.download(ticker, period="5d", interval="1h", progress=False)
+    data.columns = data.columns.get_level_values(0)
+    closes = data["Close"].values.tolist()
+
+    if len(closes) < 15:
+        raise ValueError(f"Not enough data for {ticker}")
+
+    state = rsi_state.get(ticker)
+
+    if state is None:
+        changes = [closes[i] - closes[i - 1] for i in range(1, 15)]
+        avg_gain = sum(c if c > 0 else 0 for c in changes) / 14
+        avg_loss = sum(-c if c < 0 else 0 for c in changes) / 14
+
+        for i in range(15, len(closes)):
+            change = closes[i] - closes[i - 1]
+            gain  = change if change > 0 else 0
+            loss  = -change if change < 0 else 0
+            avg_gain = (avg_gain * 13 + gain) / 14
+            avg_loss = (avg_loss * 13 + loss) / 14
+
+        last_processed_close = closes[-1]
+
+    else:
+        avg_gain = state["avg_gain"]
+        avg_loss = state["avg_loss"]
+        last_processed_close = state["last_close"]
+
+        try:
+            last_idx = closes.index(last_processed_close)
+        except ValueError:
+            rsi_state.pop(ticker)
+            return rsi(ticker)
+
+        new_closes = closes[last_idx + 1:]
+
+        if not new_closes:
+            return state["RSI"]
+
+        for close in new_closes:
+            change = close - last_processed_close
+            gain  = change if change > 0 else 0
+            loss  = -change if change < 0 else 0
+            avg_gain = (avg_gain * 13 + gain) / 14
+            avg_loss = (avg_loss * 13 + loss) / 14
+            last_processed_close = close
+
+    if avg_loss == 0:
+        RSI = 100.0
+    else:
+        RS = avg_gain / avg_loss
+        RSI = 100 - (100 / (1 + RS))
+
+    rsi_state[ticker] = {
+        "avg_gain": avg_gain,
+        "avg_loss": avg_loss,
+        "last_close": last_processed_close,
+        "RSI": RSI,
+    }
+    return RSI
+
+def exit_all_trades():
+    r_list = oanda_trades.TradesList(accountID=oanda_account_id, params={"state": "OPEN"})
+    try:
+        open_trades = client.request(r_list)
+        trade_list = open_trades.get('trades', [])
+
+        if not trade_list:
+            print("No open trades to close.")
+            return
+
+        print(f"Closing {len(trade_list)} open trades...")
+
+        for trade in trade_list:
+            trade_id = trade['id']
+            instrument = trade['instrument']
+
+            data = {"units": "ALL"}
+            r_close = oanda_trades.TradeClose(accountID=oanda_account_id, tradeID=trade_id, data=data)
+
+            client.request(r_close)
+            print(f"Closed Trade ID: {trade_id} ({instrument})")
+
+    except Exception as e:
+        print(f"An error occurred while exiting trades: {e}")
+
+trades_closed = False
+def is_market_open():
+  twenty = 20 #winter hours, for summer daylight savings, add 1
+  twenty_two =22 #winter hours, for summer daylight savings, add 1
+  day_td = datetime.now(timezone.utc).weekday()
+  current_hour = datetime.now(timezone.utc).hour
+  current_minute = datetime.now(timezone.utc).minute
+  if 0 <= day_td <= 3:
+    return True
+  if day_td == 5:
+    return False
+  if day_td == 4: #if today is friday
+    if current_hour < twenty: #if hour on clock is less than 21
+      return True
+    elif current_hour == twenty:
+      if current_minute < 30:
+        return True
+      if current_minute >= 30:
+        if trades_closed == False:
+          try:
+            exit_all_trades()
+            trades_closed = True
+            return False
+          except:
+            return False
+        else:
+          pass
+    else:
+      return False
+  if day_td == 6:
+    if current_hour > twenty_two:
+      return True
+    if current_hour == twenty_two:
+      if current_minute >= 0:
+        return True
+      else:
+        return False
+    else:
+      return True
+  else:
+    return False
+
+def cooldown_period():
+    trades = []
+    try:
+        params = {"instrument": oanda_ticker, "state": "CLOSED", "count": 1}
+        cooldownr = trades_endpoints.TradesList(accountID=oanda_account_id, params=params)
+        client.request(cooldownr)
+        trades = cooldownr.response.get("trades", [])
+    except Exception as e:
+        print(f"Cooldown check error: {e}")
+        return True
+    if not trades:
+        return True
+    close_time = datetime.fromisoformat(trades[0]["closeTime"][:26] + "+00:00")
+    return datetime.now(timezone.utc) - close_time > timedelta(hours=24)
+
+
+def trade_logic_htf(yf_ticker):
+    global swing_high_index
+    global swing_high_price
+    global swing_low_index
+    global swing_low_price
+    swing_high_index.clear()
+    swing_high_price.clear()
+    swing_low_index.clear()
+    swing_low_price.clear()
+    intersection_trend_htf.clear()
+    clse_htf = []
+    high_htf = []
+    low_htf = []
+    opn_htf = []
+    volume_htf = []
+    dte_i_htf = []
+    sma_y_htf = []
+    sma_x_htf = []
+    ema_y_htf = []
+    dte_htf = []
+    dte_raw_htf = []
+    date_numeric_htf = []
+    crossover_both_htf = []
+    intersection_date_return_value_htf = []
+    intersection_price_return_value_htf = []
+
+
+    ticker = yf_ticker
+    window = 20
+    window_initial = window
+    e_inp = 200
+    p_inp = "14d"
+    inp_interval = "1h"
+
+    data_htf = yf.download(ticker, period=p_inp, interval=inp_interval)
+    data_htf.to_csv("data_htf.csv")
+    data_htf.columns = data_htf.columns.get_level_values(0)
+    clse_htf = data_htf.loc[ : ,"Close"]
+    clse_htf = clse_htf.values.tolist()
+    open_htf = data_htf.loc[ : ,"Open"]
+    opn_htf = open_htf.values.tolist()
+    high_htf = data_htf.loc[ : ,"High"]
+    high_htf = high_htf.values.tolist()
+    low_htf = data_htf.loc[ : ,"Low"]
+    low_htf = low_htf.values.tolist()
+    volume_htf = data_htf.loc[ : ,"Volume"]
+    volume_htf = volume_htf.values.tolist()
+    dte_htf = data_htf.index.tolist()
+
+    data_htf_daily = yf.download(ticker, period="700d", interval="1h")
+    data_htf_daily.to_csv("data_htf_daily.csv")
+    data_htf_daily.columns = data_htf_daily.columns.get_level_values(0)
+    clse_htf_daily = data_htf_daily.loc[ : ,"Close"]
+    clse_htf_daily = clse_htf_daily.values.tolist()
+    open_htf_daily = data_htf_daily.loc[ : ,"Open"]
+    opn_htf_daily = open_htf_daily.values.tolist()
+    high_htf_daily = data_htf_daily.loc[ : ,"High"]
+    high_htf_daily = high_htf_daily.values.tolist()
+    low_htf_daily = data_htf_daily.loc[ : ,"Low"]
+    low_htf_daily = low_htf_daily.values.tolist()
+    volume_htf_daily = data_htf_daily.loc[ : ,"Volume"]
+    volume_htf_daily = volume_htf_daily.values.tolist()
+    dte_htf_daily = data_htf_daily.index.tolist()
+
+
+    swing1L_h = 0
+    swing2L_h = 1
+    swing_m_h = 2
+    swing1R_h = 3
+    swing2R_h = 4
+
+    for x in (range((len(high_htf_daily)) - 5)):
+      if high_htf_daily[swing_m_h] > high_htf_daily[swing1L_h]:
+        if high_htf_daily[swing_m_h] > high_htf_daily[swing2L_h]:
+          if high_htf_daily[swing_m_h] > high_htf_daily[swing1R_h]:
+            if high_htf_daily[swing_m_h] > high_htf_daily[swing2R_h]:
+              swing_high_index.append(swing_m_h)
+            else:
+              pass
+          else:
+            pass
+        else:
+          pass
+      else:
+        pass
+      swing1L_h += 1
+      swing2L_h += 1
+      swing_m_h += 1
+      swing1R_h += 1
+      swing2R_h += 1
+    for item in swing_high_index:
+      swing_high_price.append(high_htf_daily[item])
+
+
+
+    swing1L_l = 0
+    swing2L_l = 1
+    swing_m_l = 2
+    swing1R_l = 3
+    swing2R_l = 4
+
+
+    for x in (range((len(low_htf_daily)) - 5)):
+      if low_htf_daily[swing_m_l] < low_htf_daily[swing1L_l]:
+        if low_htf_daily[swing_m_l] < low_htf_daily[swing2L_l]:
+          if low_htf_daily[swing_m_l] < low_htf_daily[swing1R_l]:
+            if low_htf_daily[swing_m_l] < low_htf_daily[swing2R_l]:
+              swing_low_index.append(swing_m_l)
+            else:
+              pass
+          else:
+            pass
+        else:
+          pass
+      else:
+        pass
+      swing1L_l += 1
+      swing2L_l += 1
+      swing_m_l += 1
+      swing1R_l += 1
+      swing2R_l += 1
+    for item in swing_low_index:
+      swing_low_price.append(low_htf_daily[item])
+
+    s = 0
+    e = e_inp + 1
+    i_htf = len(clse_htf)
+
+    while e <= i_htf:
+        sma_htf = clse_htf[s:e]
+        result_htf = sum(sma_htf) / len(sma_htf)
+        sma_y_htf.append(result_htf)
+        if e - 1 < len(dte_htf):
+            sma_x_htf.append(dte_htf[e - 1])
+        else:
+            break
+        s += 1
+        e += 1
+
+    ema_initial_calc_htf = clse_htf[0:(window + 1)]
+    ema_initial_htf = sum(ema_initial_calc_htf) / len(ema_initial_calc_htf)
+    ema_y_htf.append(ema_initial_htf)
+    while window + 1 < i_htf:
+        alpha = 2 / (window_initial + 1)
+        ty_price_htf = clse_htf[window + 1]
+        yy_ema_htf = ema_y_htf[-1]
+        ema_t_htf = (ty_price_htf * alpha) + (yy_ema_htf * (1 - alpha))
+        ema_y_htf.append(ema_t_htf)
+        window += 1
+
+    eqx_htf, eqy_htf = sp.symbols('eqx eqy')
+    start_index_htf = max(e_inp, window_initial)
+
+    if window_initial > e_inp:
+        sma_aligned_htf = sma_y_htf[start_index_htf:]
+        ema_aligned_htf = ema_y_htf[:]
+    else:
+        sma_aligned_htf = sma_y_htf[:]
+        ema_aligned_htf = ema_y_htf[(start_index_htf - window_initial):]
+
+    for cd_htf in dte_htf[start_index_htf:]:
+        date_numeric_htf.append(cd_htf.timestamp())
+
+    for a_htf in range(len(date_numeric_htf)):
+        if (a_htf + 1) >= len(date_numeric_htf):
+            break
+        dif_0_htf = sma_aligned_htf[a_htf] - ema_aligned_htf[a_htf]
+        dif_1_htf = sma_aligned_htf[a_htf + 1] - ema_aligned_htf[a_htf + 1]
+        if dif_0_htf * dif_1_htf < 0:
+            gradient_sma_htf = (sma_aligned_htf[a_htf + 1] - sma_aligned_htf[a_htf]) / (date_numeric_htf[a_htf + 1] - date_numeric_htf[a_htf])
+            gradient_ema_htf = (ema_aligned_htf[a_htf + 1] - ema_aligned_htf[a_htf]) / (date_numeric_htf[a_htf + 1] - date_numeric_htf[a_htf])
+            sma_eq_htf = sp.Eq(eqy_htf - sma_aligned_htf[a_htf], gradient_sma_htf * (eqx_htf - date_numeric_htf[a_htf]))
+            ema_eq_htf = sp.Eq(eqy_htf - ema_aligned_htf[a_htf], gradient_ema_htf * (eqx_htf - date_numeric_htf[a_htf]))
+            intersection_htf = sp.solve((sma_eq_htf, ema_eq_htf), (eqx_htf, eqy_htf))
+            crossover_both_htf.append(intersection_htf)
+
+    for item_htf in crossover_both_htf:
+        eqx_a_htf = datetime.fromtimestamp(float(item_htf[eqx_htf]))
+        eqy_a_htf = float(item_htf[eqy_htf])
+        intersection_date_return_value_htf.append(eqx_a_htf)
+        intersection_price_return_value_htf.append(eqy_a_htf)
+
+    if sma_aligned_htf[-1] > ema_aligned_htf[-1]:
+        intersection_trend_htf.append("Bearish")
+    elif sma_aligned_htf[-1] < ema_aligned_htf[-1]:
+        intersection_trend_htf.append("Bullish")
+    else:
+            if sma_aligned_htf[-1 - 1] > ema_aligned_htf[-1 - 1]:
+                intersection_trend_htf.append("Bearish")
+            elif sma_aligned_htf[-1 - 1] < ema_aligned_htf[-1 - 1]:
+                intersection_trend_htf.append("Bullish")
+
+
+
+def trade_logic_ltf(yf_ticker):
+    global clse
+    clse.clear()
+    intersection_price_return_value.clear()
+    intersection_trend.clear()
+    high = []
+    low = []
+    opn = []
+    volume = []
+    dte_i = []
+    sma_y = []
+    sma_x = []
+    ema_y = []
+    ema_x = []
+    dte = []
+    dte_raw = []
+    date_numeric = []
+    crossover_both = []
+    intersection_date_return_value = []
+
+    ticker = yf_ticker
+    window = 20
+    window_initial = window
+    e_inp = 200
+    p_inp = "5d"
+    inp_interval = "5m"
+
+    data = yf.download(ticker, period=p_inp, interval=inp_interval)
+    data.to_csv("data.csv")
+    data = yf.download(ticker, period=p_inp, interval=inp_interval)
+    data.to_csv("data.csv")
+    data.columns = data.columns.get_level_values(0)
+    clse = data.loc[ : ,"Close"]
+    clse = clse.values.tolist()
+    open = data.loc[ : ,"Open"]
+    opn = open.values.tolist()
+    high = data.loc[ : ,"High"]
+    high = high.values.tolist()
+    low = data.loc[ : ,"Low"]
+    low = low.values.tolist()
+    volume = data.loc[ : ,"Volume"]
+    volume = volume.values.tolist()
+    dte = data.index.tolist()
+
+    s = 0
+    e = e_inp + 1
+    sma_title = e - 1
+    i = len(clse)
+
+    plt.figure(figsize=(12, 6))
+    plt.xlabel("Date")
+    plt.ylabel("Moving average")
+    plt.title("Moving Average")
+
+    while e <= i:
+        sma = clse[s:e]
+        result = sum(sma) / len(sma)
+        sma_y.append(result)
+        if e - 1 < len(dte):
+            sma_x.append(dte[e - 1])
+        else:
+            break
+        s += 1
+        e += 1
+
+    ema_initial_calc = clse[0:(window + 1)]
+    ema_initial = sum(ema_initial_calc) / len(ema_initial_calc)
+    ema_y.append(ema_initial)
+    while window + 1 < i:
+        alpha = 2 / (window_initial + 1)
+        ty_price = clse[window + 1]
+        yy_ema = ema_y[-1]
+        ema_t = (ty_price * alpha) + (yy_ema * (1 - alpha))
+        ema_y.append(ema_t)
+        window += 1
+    ema_x = dte[window_initial:]
+
+    plt.plot(sma_x, sma_y, label=(f"{sma_title}SMA"), color="red")
+    plt.plot(ema_x, ema_y, label=(f"{window_initial}EMA"), color="blue")
+    plt.plot(dte, clse, label="Close", color="green")
+
+    eqx, eqy = sp.symbols('eqx eqy')
+    start_index = max(e_inp, window_initial)
+
+    if window_initial > e_inp:
+        sma_aligned = sma_y[start_index:]
+        ema_aligned = ema_y[:]
+    else:
+        sma_aligned = sma_y[:]
+        ema_aligned = ema_y[(start_index - window_initial):]
+
+    for cd in dte[start_index:]:
+        date_numeric.append(cd.timestamp())
+
+    for a in range(len(date_numeric)):
+        if (a + 1) >= len(date_numeric):
+            break
+        dif_0 = sma_aligned[a] - ema_aligned[a]
+        dif_1 = sma_aligned[a + 1] - ema_aligned[a + 1]
+        if dif_0 * dif_1 < 0:
+            gradient_sma = (sma_aligned[a + 1] - sma_aligned[a]) / (date_numeric[a + 1] - date_numeric[a])
+            gradient_ema = (ema_aligned[a + 1] - ema_aligned[a]) / (date_numeric[a + 1] - date_numeric[a])
+            sma_eq = sp.Eq(eqy - sma_aligned[a], gradient_sma * (eqx - date_numeric[a]))
+            ema_eq = sp.Eq(eqy - ema_aligned[a], gradient_ema * (eqx - date_numeric[a]))
+            intersection = sp.solve((sma_eq, ema_eq), (eqx, eqy))
+            crossover_both.append(intersection)
+
+    for item in crossover_both:
+        eqx_a = datetime.fromtimestamp(float(item[eqx]))
+        eqy_a = float(item[eqy])
+        intersection_date_return_value.append(eqx_a)
+        intersection_price_return_value.append(eqy_a)
+
+    if sma_aligned[-1] > ema_aligned[-1]:
+        intersection_trend.append("Bearish")
+    elif sma_aligned[-1] < ema_aligned[-1]:
+        intersection_trend.append("Bullish")
+    else:
+      if sma_aligned[-1] > ema_aligned[-1]:
+          intersection_trend.append("Bearish")
+      elif sma_aligned[-1] < ema_aligned[-1]:
+          intersection_trend.append("Bullish")
+
+    print(intersection_date_return_value[-1])
+    print(intersection_price_return_value[-1])
+    print("Open: ", opn[-1])
+    print("Close: ", clse[-1])
+    print("High: ", high[-1])
+    print("Low: ", low[-1])
+    global intersection_date_return_value_latest
+    intersection_date_return_value_latest = intersection_date_return_value[-1]
+    ymin = min(clse)
+    ymax = max(clse)
+    plt.vlines(intersection_date_return_value, ymin, ymax, color='purple')
+    plt.tight_layout()
+    plt.grid()
+    plt.legend(loc="upper left")
+    plt.savefig(f"chart_{yf_ticker}.png")
+    plt.close('all')
+    #plt.show()
+
+
+while True:
+    for ticker in yf_ticker_list:
+      if is_market_open():
+          print("\nMarket is open. Running trading bot.")
+          try:
+            trade_logic_htf(ticker)
+            trade_logic_ltf(ticker)
+          except Exception as e:
+            print(f"Error in trade logic for {ticker}: {e}")
+            continue
+          try:
+            rsi_value = rsi(ticker)
+          except:
+            rsi_value = 50
+            pass
+          print("Trend on the 1 hour time frame is : ",  intersection_trend_htf[-1])
+          print(f"Current trend on the 5-min time frame is {intersection_trend[-1]}")
+
+          inp_lower = -0.75
+          inp_upper = 0.75
+          trade_bias = "N.A"
+          pct_diff = None
+
+          if (intersection_price_return_value and intersection_trend and intersection_trend_htf):
+              pct_diff = ((clse[-1] - intersection_price_return_value[-1]) / intersection_price_return_value[-1]) * 100
+              if inp_lower < pct_diff < inp_upper:
+                  if intersection_trend[-1] == intersection_trend_htf[-1]:
+                      trade_bias = intersection_trend[-1]
+
+          oanda_ticker = oanda_ticker_list[yf_ticker_list.index(ticker)]
+          print(oanda_ticker)
+          convert_from = ticker[3:6]
+          convert_from = convert_from.upper()
+          conversion = ""
+          if convert_from == "AUD":
+            conversion = 1.0
+          elif convert_from in forex_pairs_dic:
+            ticker_convert = forex_pairs_dic[convert_from]
+            try:
+              conversion = float(yf.download(ticker_convert, period="1d", interval="1m")['Close'].values.flatten()[-1])
+            except:
+              print("Error aquiring conversion price data: SKIP")
+              continue
+          print(conversion)
+
+          oanda_env = "practice"
+          client = oandapyV20.API(access_token=oanda_token)
+          rg = accounts.AccountDetails(accountID=oanda_account_id)
+          response_1 = client.request(rg)
+          balance = float(response_1["account"]["balance"])
+          risk_money = balance/100
+          try:
+            current_price = float(yf.download(ticker, period="1d", interval="1m")['Close'].values.flatten()[-1])
+          except:
+            print("Error aquiring current price data: SKIP")
+            continue
+          #long
+          valid_long_swing_low = [p for p in swing_low_price if (p) < (current_price - (current_price * 0.001))]
+          if len(valid_long_swing_low) == 0:
+            print("CONTINUE HIT: no valid long swing low")
+            clear_output(wait=True)
+            continue
+          else:
+            pass
+          sl_long = valid_long_swing_low[-1]
+          valid_long_swing_high = [o for o in swing_high_price if o > ((current_price) + (1.5 * (current_price - sl_long)))]
+          if len(valid_long_swing_high) == 0:
+            print("CONTINUE HIT: no valid long swing high")
+            clear_output(wait=True)
+            continue
+          else:
+            pass
+          tp_long = valid_long_swing_high[-1]
+          try:
+            tp_long_2 = valid_long_swing_high[-2]
+          except:
+            tp_long_2 = tp_long
+          units_long = math.floor((risk_money / conversion) / abs(current_price - sl_long))
+          print("units long: ", units_long)
+          if convert_from == "JPY":
+            sl_long = round(sl_long, 3)
+            tp_long = round(tp_long, 3)
+            tp_long_2 = round(tp_long_2, 3)
+          else:
+            sl_long = round(sl_long, 5)
+            tp_long = round(tp_long, 5)
+            tp_long_2 = round(tp_long_2, 5)
+          #short
+          valid_short_swing_high = [i for i in swing_high_price if (i) > (current_price + (0.001  * current_price))]
+          if len(valid_short_swing_high) == 0:
+            print("CONTINUE HIT: no valid short swing high")
+            clear_output(wait=True)
+            continue
+          else:
+            pass
+          sl_short = valid_short_swing_high[-1]
+          valid_short_swing_low = [u for u in swing_low_price if u < ((current_price) + (1.5 * (sl_short - current_price)))]
+          if len(valid_short_swing_low) == 0:
+            print("CONTINUE HIT: no valid short swing low")
+            clear_output(wait=True)
+            continue
+          else:
+            pass
+          tp_short = valid_short_swing_low[-1]
+          try:
+            tp_short_2 = valid_short_swing_low[-2]
+          except:
+            tp_short_2 = tp_short
+          if convert_from == "JPY":
+            sl_short = round(sl_short, 3)
+            tp_short = round(tp_short, 3)
+            tp_short_2 = round(tp_short_2, 3)
+          else:
+            sl_short = round(sl_short, 5)
+            tp_short = round(tp_short, 5)
+            tp_short_2 = round(tp_short_2, 5)
+          units_short = math.floor((risk_money / conversion) / abs(current_price - sl_short))
+          print("units short: ", units_short)
+          time_since_ltf = (datetime.now() - intersection_date_return_value_latest < timedelta(hours=96))
+
+          #sort tp1, tp2
+          tp_long_list = []
+          tp_short_list = []
+
+          tp_long_list.append(tp_long)
+          tp_long_list.append(tp_long_2)
+          tp_long = min(tp_long_list)
+          tp_long_2 = max(tp_long_list)
+
+          tp_short_list.append(tp_short)
+          tp_short_list.append(tp_short_2)
+          tp_short = max(tp_short_list)
+          tp_short_2 = min(tp_short_list)
+
+          print(f"intersection_price_return_value empty: {not intersection_price_return_value}")
+          print(f"intersection_trend: {intersection_trend}")
+          print(f"intersection_trend_htf: {intersection_trend_htf}")
+          print(f"pct_diff: {pct_diff if intersection_price_return_value else 'N/A - no crossover data'}")
+          print(f"inp_lower < pct_diff < inp_upper: {inp_lower < pct_diff < inp_upper if intersection_price_return_value else 'N/A'}")
+          print(f"trends match: {intersection_trend[-1] == intersection_trend_htf[-1] if intersection_trend and intersection_trend_htf else 'N/A'}")
+          print(f"trade_bias: {trade_bias}")
+          print(f"Balance: {balance}")
+
+          order_data_1 = {}
+          order_data_2 = {}
+          client = oandapyV20.API(access_token=oanda_token, environment=oanda_env)
+          rr = positions.OpenPositions(accountID=oanda_account_id)
+          response = client.request(rr)
+          print("In trades: ", len(response["positions"]))
+          in_position = 0
+          for pos in response["positions"]:
+            if pos["instrument"] == oanda_ticker:
+              in_position = 1
+          if in_position == 0:
+              if trade_bias == "Bullish":
+                if time_since_ltf == True:
+                  if (tp_long - current_price) >= (current_price - sl_long):
+                    if cooldown_period():
+                      if 45 <= rsi_value <= 60:
+                        print("Entering Bullish Trade(TP1)")
+                        order_data_1 = {
+                            "order": {
+                                "instrument": oanda_ticker,
+                                "units": str(math.floor((units_long) * 0.75)),
+                                "type": "MARKET",
+                                "positionFill": "DEFAULT",
+                                "stopLossOnFill": {"price": f"{sl_long:.5f}"},
+                                "takeProfitOnFill": {"price": f"{tp_long:.5f}"}}}
+                        print("Entering Bullish Trade(TP2)")
+                        order_data_2 = {
+                            "order": {
+                                "instrument": oanda_ticker,
+                                "units": str(math.floor((units_long) * 0.25)),
+                                "type": "MARKET",
+                                "positionFill": "DEFAULT",
+                                "stopLossOnFill": {"price": f"{sl_long:.5f}"},
+                                "takeProfitOnFill": {"price": f"{tp_long_2:.5f}"}}}
+                        try:
+                          r_1 = orders.OrderCreate(oanda_account_id, data=order_data_1)
+                          r_2 = orders.OrderCreate(oanda_account_id, data=order_data_2)
+                          response_1 = client.request(r_1)
+                          response_2 = client.request(r_2)
+                        except Exception as e:
+                          print("Error placing order:", e)
+                      else:
+                        print("RSI not ideal")
+                    else:
+                      print("Within cooldown period")
+                      continue
+                  else:
+                    print("RR is not good enough to enter")
+                elif time_since_ltf == False:
+                  print("Out of time")
+
+
+              elif trade_bias == "Bearish":
+                if time_since_ltf == True:
+                  if (current_price - tp_short) >= (sl_short - current_price):
+                    if cooldown_period():
+                      if 40 <= rsi_value <= 55:
+                        print("Entering Bearish Trade(TP1)")
+                        order_data_1 = {
+                            "order": {
+                                "instrument": oanda_ticker,
+                                "units": str(math.floor((-(units_short)) * 0.75)),
+                                "type": "MARKET",
+                                "positionFill": "DEFAULT",
+                                "stopLossOnFill": {"price": f"{sl_short:.5f}"},
+                                "takeProfitOnFill": {"price": f"{tp_short:.5f}"}}}
+                        print("Entering Bearish Trade(TP2)")
+                        order_data_2 = {
+                            "order": {
+                                "instrument": oanda_ticker,
+                                "units": str(math.floor((-(units_short)) * 0.25)),
+                                "type": "MARKET",
+                                "positionFill": "DEFAULT",
+                                "stopLossOnFill": {"price": f"{sl_short:.5f}"},
+                                "takeProfitOnFill": {"price": f"{tp_short_2:.5f}"}}}
+                        try:
+                          r_1 = orders.OrderCreate(oanda_account_id, data=order_data_1)
+                          r_2 = orders.OrderCreate(oanda_account_id, data=order_data_2)
+                          response_1 = client.request(r_1)
+                          response_2 = client.request(r_2)
+                        except Exception as e:
+                          print("Error placing order:", e)
+                      else:
+                        print("RSI is not ideal")
+                    else:
+                      print("Within cooldown period")
+                      continue
+                  else:
+                    print("RR is not good enough")
+                elif time_since_ltf == False:
+                  print("Out of time")
+              else:
+                print("No definite viable trade according to ema/sma crossover")
+          else:
+            print("Already in trade")
+          t.sleep(10)
+          clear_output(wait=True)
+          plt.close('all')
+
+      else:
+          print("Market is closed. Waiting for market to open.")
+          t.sleep(60)
+          clear_output(wait=True)
