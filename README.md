@@ -1,2 +1,3 @@
 # Multi-Time-Frame-EMA-and-SMA-RSI-Swing-high-low-OANDA-API-trading-bot
 Simple beginner trading bot using EMA and SMA on 2 different time frames(able to be changed) for trend detection and confirmation with RSI and swing high/low for trade detections, uses OANDA API to trade and uses YFinance to gather data.
+All aspects are able to be edited, the pairs it trades, the RSI levels, the swing high/low levels, risk:reward ratio, the number of take profits and stop loss, the type of order, the % split for take profits, the EMA and SMA time frames. To use this version, you will need to create your own OANDA account and find your account ID and API code and put it at the top of the code before the defined functions.
